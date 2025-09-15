@@ -1,0 +1,45 @@
+{
+  "days": {
+    "2025-09-15": {
+      "metrics": {
+        "visits": 6,
+        "questionsViewed": 28,
+        "resultsShown": 4,
+        "likes": 2,
+        "dislikes": 1
+      },
+      "users": {
+        "271823315": {
+          "name": "Илья",
+          "username": "SkIlyaA",
+          "firstSeenAt": 1757935259389,
+          "lastSeenAt": 1757937252808,
+          "maxStep": 6,
+          "finished": true,
+          "liked": true,
+          "disliked": false
+        },
+        "354595436": {
+          "name": "Darina Sokolova",
+          "username": "darinasokolova",
+          "firstSeenAt": 1757936371206,
+          "lastSeenAt": 1757936386017,
+          "maxStep": 6,
+          "finished": true,
+          "liked": false,
+          "disliked": false
+        },
+        "761082179": {
+          "name": "LP",
+          "username": "Laurart1703",
+          "firstSeenAt": 1757936518622,
+          "lastSeenAt": 1757936541218,
+          "maxStep": 6,
+          "finished": true,
+          "liked": false,
+          "disliked": true
+        }
+      }
+    }
+  }
+}

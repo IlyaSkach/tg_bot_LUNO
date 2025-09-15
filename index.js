@@ -64,6 +64,303 @@ function notifyAlertFast(text) {
 const bot = new Telegraf(BOT_TOKEN);
 bot.use(session());
 
+// ===== Трекинг лидов (визит, прогресс по шагам, завершение) =====
+const LEAD_KEYS_ORDER = [
+  "type",
+  "recipient",
+  "origin",
+  "shape",
+  "color_group",
+  "budget_tier",
+];
+
+function getUserDisplay(ctx) {
+  const id = ctx.from?.id;
+  const name = [ctx.from?.first_name, ctx.from?.last_name]
+    .filter(Boolean)
+    .join(" ");
+  const link = ctx.from?.username
+    ? `@${ctx.from.username}`
+    : id
+    ? `tg://user?id=${id}`
+    : "(unknown)";
+  return { id, name: name || "", link };
+}
+
+function formatAnswers(a) {
+  const labels = {
+    type: "Тип",
+    recipient: "Получатель",
+    origin: "Происхождение",
+    shape: "Форма",
+    color_group: "Цвет",
+    budget_tier: "Сегмент",
+  };
+  const lines = [];
+  for (const key of LEAD_KEYS_ORDER) {
+    if (a && a[key]) lines.push(`${labels[key]}: ${a[key]}`);
+  }
+  return lines.join("\n");
+}
+
+function buildLeadText(ctx, statusLabel) {
+  ensureSession(ctx);
+  const { id, name, link } = getUserDisplay(ctx);
+  const a = ctx.session.flow?.answers || {};
+  const stepIdx = ctx.session.flow?.step ?? 0;
+  const total = QUESTIONS.length;
+  const currentQ =
+    QUESTIONS[stepIdx]?.question || (stepIdx >= total ? "Результат" : "");
+  const answersText = formatAnswers(a);
+  const stamp = new Date().toLocaleString("ru-RU");
+  const stepLine =
+    stepIdx < total
+      ? `${stepIdx + 1}/${total} — ${currentQ}`
+      : `завершил (${total}/${total})`;
+  return [
+    `Лид: ${link}${name ? ` (${name})` : ""} [id:${id}]`,
+    `Статус: ${statusLabel}`,
+    `Шаг: ${stepLine}`,
+    answersText ? `Ответы:\n${answersText}` : "Ответы: —",
+    `Обновлено: ${stamp}`,
+  ].join("\n");
+}
+
+async function upsertLeadProgress(ctx, statusLabel) {
+  if (!MANAGER_CHAT_ID) return; // отправляем только если указан менеджерский чат
+  try {
+    ensureSession(ctx);
+    if (!ctx.session.lead) ctx.session.lead = {};
+    const text = buildLeadText(ctx, statusLabel);
+    if (ctx.session.lead.message_id) {
+      try {
+        await ctx.telegram.editMessageText(
+          MANAGER_CHAT_ID,
+          ctx.session.lead.message_id,
+          undefined,
+          text,
+          { disable_web_page_preview: true }
+        );
+        return;
+      } catch (_) {
+        // если нельзя отредактировать (удалено/истекло) — пришлём новое
+      }
+    }
+    const sent = await ctx.telegram.sendMessage(MANAGER_CHAT_ID, text, {
+      disable_web_page_preview: true,
+    });
+    ctx.session.lead.message_id = sent.message_id;
+  } catch (_) {}
+}
+
+// ===== Автопинг простоя (15 минут по умолчанию) =====
+const IDLE_MINUTES = Number(process.env.IDLE_MINUTES || 15);
+
+function ensureLeadRuntime(ctx) {
+  ensureSession(ctx);
+  if (!ctx.session.lead) ctx.session.lead = {};
+  if (!ctx.session.lead.runtime) ctx.session.lead.runtime = {};
+  return ctx.session.lead.runtime;
+}
+
+async function sendIdlePing(ctx) {
+  if (!MANAGER_CHAT_ID) return;
+  try {
+    const rt = ensureLeadRuntime(ctx);
+    if (rt.idlePingSent) return;
+    rt.idlePingSent = true;
+    const { id, name, link } = getUserDisplay(ctx);
+    const stepIdx = ctx.session.flow?.step ?? 0;
+    const total = QUESTIONS.length;
+    const currentQ =
+      QUESTIONS[stepIdx]?.question || (stepIdx >= total ? "Результат" : "");
+    const answersText = formatAnswers(ctx.session.flow?.answers || {});
+    const text = [
+      `Автопинг: пользователь ушёл (нет активности ${IDLE_MINUTES} минут)`,
+      `Лид: ${link}${name ? ` (${name})` : ""} [id:${id}]`,
+      `Шаг: ${
+        stepIdx < total
+          ? `${stepIdx + 1}/${total} — ${currentQ}`
+          : `завершил (${total}/${total})`
+      }`,
+      answersText ? `Ответы:\n${answersText}` : "Ответы: —",
+    ].join("\n");
+    await ctx.telegram.sendMessage(MANAGER_CHAT_ID, text, {
+      disable_web_page_preview: true,
+    });
+  } catch (_) {}
+}
+
+function scheduleIdleTimer(ctx) {
+  try {
+    const rt = ensureLeadRuntime(ctx);
+    if (rt.idleTimer) clearTimeout(rt.idleTimer);
+    rt.idleTimer = setTimeout(() => {
+      sendIdlePing(ctx);
+    }, IDLE_MINUTES * 60 * 1000);
+  } catch (_) {}
+}
+
+function markActivity(ctx) {
+  const rt = ensureLeadRuntime(ctx);
+  rt.lastActivityAt = Date.now();
+  rt.idlePingSent = false; // разрешаем следующий пинг после возвращения
+  scheduleIdleTimer(ctx);
+}
+
+// ===== Ежедневный дайджест лидов =====
+const DIGEST_FILE = path.join(__dirname, "leads-digest.json");
+
+function loadDigest() {
+  try {
+    if (fs.existsSync(DIGEST_FILE)) {
+      const raw = fs.readFileSync(DIGEST_FILE, "utf8");
+      return JSON.parse(raw);
+    }
+  } catch (_) {}
+  return { days: {} };
+}
+
+function saveDigest(store) {
+  try {
+    fs.writeFileSync(DIGEST_FILE, JSON.stringify(store, null, 2));
+  } catch (_) {}
+}
+
+const DIGEST_STORE = loadDigest();
+
+function dateStr(ts = Date.now()) {
+  const d = new Date(ts);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
+
+function ensureDay(day) {
+  if (!DIGEST_STORE.days[day]) {
+    DIGEST_STORE.days[day] = {
+      metrics: {
+        visits: 0,
+        questionsViewed: 0,
+        resultsShown: 0,
+        likes: 0,
+        dislikes: 0,
+      },
+      users: {},
+    };
+  }
+  return DIGEST_STORE.days[day];
+}
+
+function digestTouchUser(day, ctx) {
+  const u = getUserDisplay(ctx);
+  const dayObj = ensureDay(day);
+  if (!dayObj.users[u.id]) {
+    dayObj.users[u.id] = {
+      name: u.name,
+      username: ctx.from?.username || null,
+      firstSeenAt: Date.now(),
+      lastSeenAt: Date.now(),
+      maxStep: 0,
+      finished: false,
+      liked: false,
+      disliked: false,
+    };
+  } else {
+    dayObj.users[u.id].lastSeenAt = Date.now();
+  }
+  return dayObj.users[u.id];
+}
+
+function digestEvent(ctx, type) {
+  const day = dateStr();
+  const dayObj = ensureDay(day);
+  const du = digestTouchUser(day, ctx);
+  switch (type) {
+    case "visit":
+      dayObj.metrics.visits++;
+      break;
+    case "question_view":
+      dayObj.metrics.questionsViewed++;
+      {
+        const stepIdx = ctx.session.flow?.step ?? 0;
+        const reached = Math.max(1, Math.min(QUESTIONS.length, stepIdx + 1));
+        if (reached > du.maxStep) du.maxStep = reached;
+      }
+      break;
+    case "result_shown":
+      dayObj.metrics.resultsShown++;
+      du.finished = true;
+      du.maxStep = Math.max(du.maxStep, QUESTIONS.length);
+      break;
+    case "like":
+      dayObj.metrics.likes++;
+      du.liked = true;
+      break;
+    case "dislike":
+      dayObj.metrics.dislikes++;
+      du.disliked = true;
+      break;
+  }
+  saveDigest(DIGEST_STORE);
+}
+
+function buildDayDigestText(day) {
+  const dayObj = DIGEST_STORE.days[day];
+  if (!dayObj) return `Дайджест за ${day}: данных нет`;
+  const uniqueUsers = Object.keys(dayObj.users).length;
+  const m = dayObj.metrics;
+  return [
+    `Дайджест лидов за ${day}`,
+    `Уникальных пользователей: ${uniqueUsers}`,
+    `Визитов: ${m.visits}`,
+    `Показов вопросов: ${m.questionsViewed}`,
+    `Показов результата: ${m.resultsShown}`,
+    `Конверсии: нравится — ${m.likes}, не подходит — ${m.dislikes}`,
+  ].join("\n");
+}
+
+async function sendDayDigest(day) {
+  if (!MANAGER_CHAT_ID) return;
+  const text = buildDayDigestText(day);
+  try {
+    await bot.telegram.sendMessage(MANAGER_CHAT_ID, text, {
+      disable_web_page_preview: true,
+    });
+  } catch (_) {}
+}
+
+const DIGEST_AT = process.env.DIGEST_AT || "09:00"; // Локальное время
+function computeNextDigestTs(now = new Date()) {
+  const [hh, mm] = DIGEST_AT.split(":").map((x) => Number(x) || 0);
+  const d = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+    hh,
+    mm,
+    0,
+    0
+  );
+  if (d <= now) d.setDate(d.getDate() + 1);
+  return d.getTime();
+}
+
+function scheduleDailyDigestTimer() {
+  let nextTs = computeNextDigestTs();
+  const planNext = () => {
+    const delay = Math.max(5000, nextTs - Date.now());
+    setTimeout(async () => {
+      const y = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      await sendDayDigest(dateStr(y.getTime()));
+      nextTs = computeNextDigestTs();
+      planNext();
+    }, delay);
+  };
+  planNext();
+}
+
 // Карта для старой структуры каталога (сохраняем как фолбэк)
 const SLUGS = {
   type: {
@@ -363,6 +660,14 @@ async function askCurrentQuestion(ctx) {
   if (current.key === "budget_tier") {
     const keyboard = buildKeyboard(answers, current.key, null, 1);
     await ctx.reply(current.question, keyboard);
+    await upsertLeadProgress(ctx, "Просмотр вопроса");
+    // учёт метрик и активности для автопинга
+    try {
+      digestEvent(ctx, "question_view");
+    } catch (_) {}
+    try {
+      markActivity(ctx);
+    } catch (_) {}
     return;
   }
 
@@ -390,17 +695,38 @@ async function askCurrentQuestion(ctx) {
       // Невидимый символ, чтобы прикрепить клавиатуру без лишнего текста
       await ctx.reply("\u2063", keyboard);
     }
+    await upsertLeadProgress(ctx, "Просмотр вопроса");
+    try {
+      digestEvent(ctx, "question_view");
+    } catch (_) {}
+    try {
+      markActivity(ctx);
+    } catch (_) {}
     return;
   } else if (imgs.length === 1) {
     await ctx.replyWithPhoto(
       { source: imgs[0] },
       { caption: current.question, ...keyboard }
     );
+    await upsertLeadProgress(ctx, "Просмотр вопроса");
+    try {
+      digestEvent(ctx, "question_view");
+    } catch (_) {}
+    try {
+      markActivity(ctx);
+    } catch (_) {}
     return;
   }
 
   // Если картинок нет — просто текст
   await ctx.reply(current.question, keyboard);
+  await upsertLeadProgress(ctx, "Просмотр вопроса");
+  try {
+    digestEvent(ctx, "question_view");
+  } catch (_) {}
+  try {
+    markActivity(ctx);
+  } catch (_) {}
 }
 
 function getResultImagePath(answers) {
@@ -538,6 +864,13 @@ async function showResult(ctx) {
       buttons
     );
   }
+  await upsertLeadProgress(ctx, "Показан результат");
+  try {
+    digestEvent(ctx, "result_shown");
+  } catch (_) {}
+  try {
+    markActivity(ctx);
+  } catch (_) {}
 }
 
 function resetFlow(ctx) {
@@ -570,6 +903,13 @@ bot.start(async (ctx) => {
   } else {
     await ctx.reply(WELCOME_TEXT, keyboard);
   }
+  await upsertLeadProgress(ctx, "Визит");
+  try {
+    digestEvent(ctx, "visit");
+  } catch (_) {}
+  try {
+    markActivity(ctx);
+  } catch (_) {}
 });
 
 bot.command("whoami", async (ctx) => {
@@ -601,12 +941,18 @@ bot.action("start_quiz", async (ctx) => {
   await safeAnswerCb(ctx);
   resetFlow(ctx);
   await askCurrentQuestion(ctx);
+  try {
+    markActivity(ctx);
+  } catch (_) {}
 });
 
 bot.action("restart", async (ctx) => {
   await safeAnswerCb(ctx);
   resetFlow(ctx);
   await askCurrentQuestion(ctx);
+  try {
+    markActivity(ctx);
+  } catch (_) {}
 });
 
 bot.action("like_choice", async (ctx) => {
@@ -656,6 +1002,13 @@ bot.action("like_choice", async (ctx) => {
       [Markup.button.url("Написать менеджеру", "https://t.me/lunodiamonds")],
     ])
   );
+  await upsertLeadProgress(ctx, "Конверсия: Мне нравится");
+  try {
+    digestEvent(ctx, "like");
+  } catch (_) {}
+  try {
+    markActivity(ctx);
+  } catch (_) {}
 });
 
 bot.action("dislike_choice", async (ctx) => {
@@ -666,6 +1019,13 @@ bot.action("dislike_choice", async (ctx) => {
       [Markup.button.url("Написать менеджеру", "https://t.me/lunodiamonds")],
     ])
   );
+  await upsertLeadProgress(ctx, "Конверсия: Мне не подходит");
+  try {
+    digestEvent(ctx, "dislike");
+  } catch (_) {}
+  try {
+    markActivity(ctx);
+  } catch (_) {}
 });
 
 bot.action(/^ans:([a-z_]+):(\d+)$/i, async (ctx) => {
@@ -681,6 +1041,9 @@ bot.action(/^ans:([a-z_]+):(\d+)$/i, async (ctx) => {
   if (typeof value === "undefined") return;
   answers[key] = value;
   ctx.session.flow.step = step + 1;
+  try {
+    markActivity(ctx);
+  } catch (_) {}
   if (ctx.session.flow.step >= QUESTIONS.length) {
     await showResult(ctx);
   } else {
@@ -696,6 +1059,16 @@ bot.command("reset", async (ctx) => {
 
 bot.launch().then(() => {
   console.log("Бот запущен. Нажмите /start в Telegram.");
+  try {
+    scheduleDailyDigestTimer();
+  } catch (_) {}
+});
+
+// Ручная команда для отправки дайджеста: /digest [YYYY-MM-DD]
+bot.command("digest", async (ctx) => {
+  const parts = (ctx.message?.text || "").trim().split(/\s+/);
+  const day = parts[1] || dateStr(Date.now() - 24 * 60 * 60 * 1000);
+  await sendDayDigest(day);
 });
 
 // Алерты о падениях/остановках на личный ALERT_CHAT_ID
